@@ -147,6 +147,18 @@ Run the test suite:
 npm test
 ```
 
+## Personal Note
+
+Human here, June 2026:
+This library is the result of one of my earliest attempts at generating code using agents, probably early 2025. It predates Claude Code and was written at a time when I wouldn't trust an agent to work on a whole codebase,
+but it worked OK-ish when creating a small project from scratch given a specification. I can't remember whether I used a GitHub Copilot beta or a Gemini version. I just remember I tried several models, and I had to go through several iterations to get a result I was happy with.
+
+The library stood the test of time, and I am using it (or rather, letting Claude use it) in practically every service I create. Every component in my RSS reader Downread.com uses it.
+Especially the extension mechanism proved to be very useful, and it will also be used by the libraries I publish next, as well as the upcoming monitoring system.
+
+Tim J
+
+
 ## License
 
 MIT
