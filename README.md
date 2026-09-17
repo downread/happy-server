@@ -83,6 +83,22 @@ export HAPPY_SECRET=none
 }
 ```
 
+### System Vitals
+
+Pass `vitals` to also report load, memory, disk usage and Linux software RAID status under `vitals` in `/happy`:
+
+```typescript
+initHappyServer(app, { vitals: { diskPaths: ['/', '/var/data'] } });
+```
+
+- `diskPaths` — mount points to report total/free bytes for (default `['/']`).
+- `mdstatPath` — where to read the md RAID status from (default `/proc/mdstat`).
+
+`vitals.raid` lists every md array with its level, member devices (with failed/spare flags), the
+`[2/2] [UU]` slot status and any running recovery/resync. It is omitted on hosts without md arrays.
+A degraded array (e.g. `[2/1] [_U]`, see https://kb.server4you.com/hardware/raid/status) also
+shows up as `raid` in `extensionFailures`, so `/happy/quick` consumers notice it too.
+
 ### Extension Mechanism
 
 Other libraries can register custom stats to appear in `/happy`:
@@ -138,6 +154,7 @@ An empty `extensionFailures` array means all checks passed.
 
 - `HappyServerResponse`: Full response from `/happy`
 - `HappyQuickResponse`: Response from `/happy/quick`
+- `VitalSnapshot`, `RaidStatus`, `RaidArray`: Parts of `vitals`; `parseMdstat()` parses `/proc/mdstat` content
 
 ## Testing
 

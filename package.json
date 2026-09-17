@@ -1,6 +1,6 @@
 {
   "name": "@downread/happy-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Express middleware to provide a /happy endpoint for server health and stats.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

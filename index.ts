@@ -34,6 +34,33 @@ export interface VitalSnapshot {
     disks: { path: string; total: number; free: number }[];
 }
 
+/** One member device of a Linux software RAID (md) array, as listed in /proc/mdstat. */
+export interface RaidDevice {
+    name: string;    // e.g. 'sda1'
+    failed: boolean; // marked (F) in mdstat
+    spare: boolean;  // marked (S) in mdstat
+}
+
+/** One md array parsed from /proc/mdstat. */
+export interface RaidArray {
+    name: string;            // e.g. 'md0'
+    state: string;           // 'active', 'inactive', 'active (auto-read-only)', ...
+    level?: string;          // 'raid1', 'raid5', ... (absent for inactive arrays)
+    devices: RaidDevice[];
+    blocks?: number;
+    total?: number;          // expected number of devices, from '[2/2]'
+    active?: number;         // working devices, from '[2/2]'
+    status?: string;         // per-slot status string, e.g. 'UU' or '_U' ('_' = missing/failed)
+    healthy: boolean;        // active and no slot missing
+    /** In-progress recovery/resync/reshape/check. `percent` is absent while DELAYED/PENDING (see `finish`). */
+    operation?: { type: string; percent?: number; finish?: string; speed?: string };
+}
+
+export interface RaidStatus {
+    healthy: boolean;
+    arrays: RaidArray[];
+}
+
 interface VitalsState {
     lastMinuteCollect: number;
     lastFiveMinCollect: number;
@@ -80,6 +107,8 @@ export interface HappyServerResponse {
         minuteSnapshots: VitalSnapshot[];
         fiveMinuteSnapshots: VitalSnapshot[];
         hourSnapshots: VitalSnapshot[];
+        /** Software RAID status; omitted when the host has no md arrays (no /proc/mdstat, e.g. macOS). */
+        raid?: RaidStatus;
     };
 }
 
@@ -117,6 +146,8 @@ export interface HappyServerOptions {
     nowFn?: () => number;
     vitals?: {
         diskPaths?: string[];
+        /** Where to read Linux software RAID status from. Default '/proc/mdstat'. */
+        mdstatPath?: string;
     };
     noRequestBeforeShutdownS?: number;
     /** @internal Override process.exit for testing */
@@ -248,6 +279,8 @@ export function happyShutdownInfo(): { message: string; secondsTillShutdown: num
 // --- Vitals State ---
 let vitalsEnabled = false;
 let vitalsDiskPaths: string[] = ['/'];
+let vitalsMdstatPath = '/proc/mdstat';
+let lastRaidStatus: RaidStatus | undefined;
 const vitalsState: VitalsState = {
     lastMinuteCollect: 0,
     lastFiveMinCollect: 0,
@@ -274,9 +307,79 @@ function collectSnapshot(): VitalSnapshot {
     return { load, memTotal, memFree, disks };
 }
 
+const RAID_LEVELS = /^(raid\d+|linear|multipath|faulty)$/;
+
+/**
+ * Parses the content of /proc/mdstat. See https://kb.server4you.com/hardware/raid/status —
+ * a healthy RAID 1 shows '[2/2] [UU]', a degraded one '[2/1] [_U]'.
+ */
+export function parseMdstat(text: string): RaidArray[] {
+    const arrays: RaidArray[] = [];
+    let current: RaidArray | undefined;
+    for (const line of text.split('\n')) {
+        const header = line.match(/^(md\d+)\s*:\s*(.*)$/);
+        if (header) {
+            const tokens = header[2].trim().split(/\s+/);
+            let state = tokens.shift() || '';
+            if (tokens[0]?.startsWith('(')) state += ' ' + tokens.shift();
+            const level = tokens[0] && RAID_LEVELS.test(tokens[0]) ? tokens.shift() : undefined;
+            const devices = tokens.map(t => {
+                const m = t.match(/^([^\[(]+)(?:\[\d+\])?(.*)$/);
+                const flags = m?.[2] || '';
+                return { name: m?.[1] || t, failed: flags.includes('(F)'), spare: flags.includes('(S)') };
+            });
+            current = { name: header[1], state, level, devices, healthy: state.startsWith('active') && !devices.some(d => d.failed) };
+            arrays.push(current);
+            continue;
+        }
+        if (!current) continue;
+        if (!line.trim()) {
+            current = undefined;
+            continue;
+        }
+        const blocks = line.match(/(\d+) blocks/);
+        if (blocks) {
+            current.blocks = Number(blocks[1]);
+            const slots = line.match(/\[(\d+)\/(\d+)\]\s*\[([U_]+)\]/);
+            if (slots) {
+                current.total = Number(slots[1]);
+                current.active = Number(slots[2]);
+                current.status = slots[3];
+                current.healthy = current.state.startsWith('active') && !current.status.includes('_');
+            }
+            continue;
+        }
+        const op = line.match(/(recovery|resync|reshape|check)\s*=\s*(\S+)/);
+        if (op) {
+            const percent = op[2].endsWith('%') ? parseFloat(op[2]) : undefined;
+            current.operation = {
+                type: op[1],
+                percent,
+                finish: line.match(/finish=(\S+)/)?.[1] ?? (percent == undefined ? op[2] : undefined),
+                speed: line.match(/speed=(\S+)/)?.[1],
+            };
+        }
+    }
+    return arrays;
+}
+
+/** Reads the software RAID status. Undefined if there is no mdstat file or it lists no arrays. */
+function readRaidStatus(): RaidStatus | undefined {
+    let text: string;
+    try {
+        text = fs.readFileSync(vitalsMdstatPath, 'utf8');
+    } catch {
+        return undefined;
+    }
+    const arrays = parseMdstat(text);
+    if (!arrays.length) return undefined;
+    return { healthy: arrays.every(a => a.healthy), arrays };
+}
+
 function storeVitalSnapshot() {
     const now = nowFn();
     const snapshot = collectSnapshot();
+    lastRaidStatus = readRaidStatus();
 
     // Always push to minute
     vitalsState.minuteSnapshots.unshift(snapshot);
@@ -567,6 +670,7 @@ function happyEndpoint(req: Request, res: Response) {
             minuteSnapshots: vitalsState.minuteSnapshots,
             fiveMinuteSnapshots: vitalsState.fiveMinuteSnapshots,
             hourSnapshots: vitalsState.hourSnapshots,
+            raid: lastRaidStatus = readRaidStatus(),
         };
     }
     res.json(response);
@@ -657,8 +761,13 @@ export function initHappyServer(app: any, options?: HappyServerOptions) {
 
     // --- Vitals setup ---
     vitalsEnabled = !!options?.vitals;
+    delete happyServerQuickExtension['raid'];
     if (options?.vitals) {
         vitalsDiskPaths = options.vitals.diskPaths || ['/'];
+        vitalsMdstatPath = options.vitals.mdstatPath || '/proc/mdstat';
+        // A degraded array is reported as a failed quick check, so /happy/quick consumers
+        // (dashboard overview, clawnitor) notice without parsing the full response.
+        happyServerQuickExtension['raid'] = () => !lastRaidStatus || lastRaidStatus.healthy;
         vitalsState.minuteSnapshots = [];
         vitalsState.fiveMinuteSnapshots = [];
         vitalsState.hourSnapshots = [];

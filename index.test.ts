@@ -1,6 +1,9 @@
 import express from 'express';
 import request from 'supertest';
-import { initHappyServer, collectVitalsNow, happyTimeTillShutdownS, onShutdownChange, onBeforeShutdown } from './index';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { initHappyServer, collectVitalsNow, happyTimeTillShutdownS, onShutdownChange, onBeforeShutdown, parseMdstat } from './index';
 
 describe('happy-server', () => {
 
@@ -632,6 +635,147 @@ describe('vitals', () => {
     const res = await request(app).get('/happy');
     // Only the initial snapshot on the boundary
     expect(res.body.vitals.fiveMinuteSnapshots.length).toBe(1);
+  });
+});
+
+const MDSTAT_HEALTHY = `Personalities : [raid1] [linear] [multipath] [raid0] [raid6] [raid5] [raid4] [raid10]
+md1 : active raid1 sda3[0] sdb3[1]
+      154143552 blocks super 1.2 [2/2] [UU]
+      bitmap: 1/2 pages [4KB], 65536KB chunk
+
+md0 : active raid1 sdb1[0] sda1[1]
+      104320 blocks [2/2] [UU]
+
+unused devices: <none>
+`;
+
+const MDSTAT_DEGRADED = `Personalities : [raid1]
+md1 : active raid1 sdb3[1]
+      154143552 blocks [2/1] [_U]
+
+md0 : active raid1 sdb1[0] sda1[1]
+      104320 blocks [2/2] [UU]
+
+unused devices: <none>
+`;
+
+const MDSTAT_RECOVERING = `Personalities : [raid1]
+md1 : active raid1 sda3[2] sdb3[1] sdc3[3](S)
+      154143552 blocks [2/1] [_U]
+      [=>...................]  recovery =  5.0% (7700000/154143552) finish=30.5min speed=80000K/sec
+
+unused devices: <none>
+`;
+
+describe('parseMdstat', () => {
+  it('parses healthy arrays', () => {
+    const arrays = parseMdstat(MDSTAT_HEALTHY);
+    expect(arrays).toHaveLength(2);
+    expect(arrays[0]).toEqual({
+      name: 'md1', state: 'active', level: 'raid1',
+      devices: [{ name: 'sda3', failed: false, spare: false }, { name: 'sdb3', failed: false, spare: false }],
+      blocks: 154143552, total: 2, active: 2, status: 'UU', healthy: true,
+    });
+    expect(arrays[1].name).toBe('md0');
+    expect(arrays[1].healthy).toBe(true);
+    expect(arrays[1].operation).toBeUndefined();
+  });
+
+  it('detects a degraded array', () => {
+    const arrays = parseMdstat(MDSTAT_DEGRADED);
+    expect(arrays[0]).toMatchObject({ name: 'md1', total: 2, active: 1, status: '_U', healthy: false });
+    expect(arrays[0].devices).toEqual([{ name: 'sdb3', failed: false, spare: false }]);
+    expect(arrays[1].healthy).toBe(true);
+  });
+
+  it('parses recovery progress, spares and failed devices', () => {
+    const [md1] = parseMdstat(MDSTAT_RECOVERING);
+    expect(md1.healthy).toBe(false);
+    expect(md1.devices[2]).toEqual({ name: 'sdc3', failed: false, spare: true });
+    expect(md1.operation).toEqual({ type: 'recovery', percent: 5, finish: '30.5min', speed: '80000K/sec' });
+
+    const [failed] = parseMdstat('md0 : active raid1 sda1[0](F) sdb1[1]\n      104320 blocks [2/1] [U_]\n');
+    expect(failed.devices[0]).toEqual({ name: 'sda1', failed: true, spare: false });
+    expect(failed.healthy).toBe(false);
+  });
+
+  it('handles delayed resync, auto-read-only and inactive arrays', () => {
+    const arrays = parseMdstat(`md2 : active (auto-read-only) raid5 sda4[0] sdb4[1] sdc4[2]
+      1000 blocks level 5, 64k chunk, algorithm 2 [3/3] [UUU]
+      \tresync=DELAYED
+
+md3 : inactive sdd1[0](S)
+      500 blocks super 1.2
+`);
+    expect(arrays[0]).toMatchObject({ state: 'active (auto-read-only)', level: 'raid5', status: 'UUU', healthy: true });
+    expect(arrays[0].operation).toEqual({ type: 'resync', percent: undefined, finish: 'DELAYED', speed: undefined });
+    expect(arrays[1]).toMatchObject({ name: 'md3', state: 'inactive', level: undefined, blocks: 500, healthy: false });
+    expect(arrays[1].devices).toEqual([{ name: 'sdd1', failed: false, spare: true }]);
+  });
+
+  it('returns no arrays for an mdstat without arrays', () => {
+    expect(parseMdstat('Personalities : \nunused devices: <none>\n')).toEqual([]);
+  });
+});
+
+describe('vitals raid', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'happy-mdstat-'));
+  const mdstatFile = (content: string) => {
+    const file = path.join(dir, `mdstat-${Math.random().toString(36).slice(2)}`);
+    fs.writeFileSync(file, content);
+    return file;
+  };
+  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('omits raid when there is no mdstat file', async () => {
+    const app = express();
+    process.env.HAPPY_SECRET = 'none';
+    initHappyServer(app, { vitals: { mdstatPath: path.join(dir, 'missing') } });
+    const res = await request(app).get('/happy');
+    expect(res.body.vitals.raid).toBeUndefined();
+    expect(res.body.extensionFailures).toEqual([]);
+  });
+
+  it('reports healthy arrays', async () => {
+    const app = express();
+    process.env.HAPPY_SECRET = 'none';
+    initHappyServer(app, { vitals: { mdstatPath: mdstatFile(MDSTAT_HEALTHY) } });
+    const res = await request(app).get('/happy');
+    expect(res.body.vitals.raid.healthy).toBe(true);
+    expect(res.body.vitals.raid.arrays.map((a: any) => a.name)).toEqual(['md1', 'md0']);
+    expect(res.body.extensionFailures).toEqual([]);
+    const quick = await request(app).get('/happy/quick');
+    expect(quick.body.extensionFailures).toEqual([]);
+  });
+
+  it('flags a degraded array as a failed quick check', async () => {
+    const app = express();
+    process.env.HAPPY_SECRET = 'none';
+    initHappyServer(app, { vitals: { mdstatPath: mdstatFile(MDSTAT_DEGRADED) } });
+    const quick = await request(app).get('/happy/quick');
+    expect(quick.body.extensionFailures).toEqual(['raid']);
+    const res = await request(app).get('/happy');
+    expect(res.body.vitals.raid.healthy).toBe(false);
+    expect(res.body.extensionFailures).toEqual(['raid']);
+  });
+
+  it('picks up status changes on the next collection', async () => {
+    const app = express();
+    process.env.HAPPY_SECRET = 'none';
+    const file = mdstatFile(MDSTAT_HEALTHY);
+    initHappyServer(app, { vitals: { mdstatPath: file } });
+    expect((await request(app).get('/happy/quick')).body.extensionFailures).toEqual([]);
+    fs.writeFileSync(file, MDSTAT_DEGRADED);
+    collectVitalsNow();
+    expect((await request(app).get('/happy/quick')).body.extensionFailures).toEqual(['raid']);
+  });
+
+  it('does not register the raid check when vitals are disabled', async () => {
+    const app = express();
+    process.env.HAPPY_SECRET = 'none';
+    initHappyServer(app);
+    const { happyServerQuickExtension } = require('./index');
+    expect(happyServerQuickExtension['raid']).toBeUndefined();
   });
 });
 
